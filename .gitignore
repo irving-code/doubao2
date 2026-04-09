@@ -1,0 +1,21 @@
+# 你的API密钥文件（绝对禁止上传）
+.env
+.env.*
+
+# Python缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 录屏/视频/大文件
+*.mp4
+*.mov
+*.avi
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 日志文件夹
+logs/
