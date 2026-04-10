@@ -1,23 +1,39 @@
 # -*- coding: utf-8 -*-
-#============================= 运行日志生成部分 =================================
 import logging
 import os
 import sys
+from logging.handlers import QueueHandler, QueueListener
+import queue
 
 # 解决Windows中文乱码问题
 sys.stdout.reconfigure(encoding='utf-8')
 
-# 配置日志：自动输出到 logs/run.log 文件 + 控制台
 log_path = os.path.join("logs", "run.log")
+log_dir = os.path.dirname(log_path)
+os.makedirs(log_dir, exist_ok=True)
+
+# 1. 定义 Handler（先创建好，但不直接加到 root logger）
+file_handler = logging.FileHandler(log_path, encoding="utf-8")
+console_handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 2. 启动异步监听线程
+log_queue = queue.Queue(-1)  # 无界队列
+queue_listener = QueueListener(log_queue, file_handler, console_handler)
+queue_listener.start()
+
+# 3. 配置 root logger 使用 QueueHandler
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_path, encoding="utf-8"),  # 写入.log文件
-        logging.StreamHandler()  # 控制台打印
-    ]
+    handlers=[QueueHandler(log_queue)]  # 只加这一个 Handler
 )
 logger = logging.getLogger(__name__)
+
+# 【可选】程序退出时记得停止监听（防止丢最后几条日志）
+# import atexit
+# atexit.register(queue_listener.stop)
 
 # ===================== 系统编码修复（Windows专属） =====================
 import sys
@@ -88,19 +104,9 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# 1. 会话主表：存储每个独立会话的核心元数据
-class AgentSession(Base):
-    __tablename__ = "agent_sessions"
-    session_id = Column(String(64), primary_key=True, index=True, comment="会话唯一ID，与LangGraph thread_id绑定")
-    user_input = Column(Text, nullable=False, comment="用户原始输入")
-    create_time = Column(DateTime, default=datetime.now, nullable=False, comment="会话创建时间")
-    end_time = Column(DateTime, nullable=True, comment="会话结束时间")
-    final_json_result = Column(Text, nullable=True, comment="最终结构化JSON输出")
-    status = Column(String(16), default="running", nullable=False, comment="执行状态：running/success/failed")
-    error_message = Column(Text, nullable=True, comment="异常信息（执行失败时存储）")
 
 
-# 2. 对话消息表：全量存储对话链路的每一条消息，可完整复现对话过程
+# 1. 对话消息表：全量存储对话链路的每一条消息，可完整复现对话过程
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
     id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()), comment="消息唯一ID")
@@ -111,7 +117,7 @@ class ChatMessage(Base):
     create_time = Column(DateTime, default=datetime.now, nullable=False, comment="消息创建时间")
 
 
-# 3. 工具调用记录表：全量存储每一次工具调用的入参、输出、状态，可追溯可复现
+# 2. 工具调用记录表：全量存储每一次工具调用的入参、输出、状态，可追溯可复现
 class ToolCallRecord(Base):
     __tablename__ = "tool_call_records"
     id = Column(String(64), primary_key=True, default=lambda: str(uuid.uuid4()), comment="调用记录ID")
@@ -129,35 +135,13 @@ Base.metadata.create_all(bind=engine)
 
 # ================== 2.数据写入层 =====================
 def get_db_session():
-    """获取数据库会话，自动关闭连接，防止连接泄漏"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def init_session_to_db(session_id: str, user_input: str):
-    """会话初始化：写入会话主表，标记为运行中"""
-    db = next(get_db_session())
-    try:
-        session_record = AgentSession(
-            session_id=session_id,
-            user_input=user_input,
-            status="running"
-        )
-        db.add(session_record)
-        db.commit()
-    except Exception as e:
-        print(f"⚠️ 会话初始化数据库写入失败：{str(e)}")
-        db.rollback()
-    finally:
-        db.close()
+    """获取数据库会话（普通函数版）"""
+    return SessionLocal()
 
 
 def save_message_to_db(session_id: str, message_type: str, content: str, sequence: int):
     """单条消息落库，全链路记录对话过程"""
-    db = next(get_db_session())
+    db = get_db_session()
     try:
         message_record = ChatMessage(
             session_id=session_id,
@@ -176,7 +160,7 @@ def save_message_to_db(session_id: str, message_type: str, content: str, sequenc
 
 def save_tool_call_to_db(session_id: str, tool_name: str, tool_args: dict, tool_output: str, status: str = "success"):
     """工具调用记录落库，完整记录入参和输出，可追溯可复现"""
-    db = next(get_db_session())
+    db = get_db_session()
     try:
         tool_record = ToolCallRecord(
             session_id=session_id,
@@ -193,23 +177,6 @@ def save_tool_call_to_db(session_id: str, tool_name: str, tool_args: dict, tool_
     finally:
         db.close()
 
-
-def update_session_finish_to_db(session_id: str, status: str, final_json: str = None, error_msg: str = None):
-    """会话结束：更新会话状态、最终结果、结束时间"""
-    db = next(get_db_session())
-    try:
-        session_record = db.query(AgentSession).filter(AgentSession.session_id == session_id).first()
-        if session_record:
-            session_record.status = status
-            session_record.end_time = datetime.now()
-            session_record.final_json_result = final_json
-            session_record.error_message = error_msg
-            db.commit()
-    except Exception as e:
-        print(f"⚠️ 会话状态更新数据库失败：{str(e)}")
-        db.rollback()
-    finally:
-        db.close()
 
 # ================================================= 三.工具层 =================================================
 
@@ -722,7 +689,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "agent_session_mcp":
         user_input = arguments["user_input"]
         session_id = str(uuid.uuid4())
-        init_session_to_db(session_id, user_input)
+
 
         # ===================== 【修复3：初始化时也加上 final_json】 =====================
         initial_state = {
@@ -775,12 +742,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "final_reply": f"工作流执行异常：{str(e)}"
             }, ensure_ascii=False)
 
-        update_session_finish_to_db(
-            session_id=session_id,
-            status=run_status,
-            final_json=final_json,
-            error_msg=None
-        )
+
 
         return [TextContent(type="text", text=final_json)]
 
@@ -827,7 +789,7 @@ if __name__ == "__main__":
 
             print("\n🔄 正在处理中...")
             session_id = str(uuid.uuid4())
-            init_session_to_db(session_id, user_input)
+
 
             initial_state = {
                 "messages": [HumanMessage(content=user_input)],
@@ -867,12 +829,6 @@ if __name__ == "__main__":
                 }, ensure_ascii=False)
                 print(f"❌ {run_error}")
 
-            update_session_finish_to_db(
-                session_id=session_id,
-                status=run_status,
-                final_json=final_json,
-                error_msg=run_error
-            )
 
             print("\n" + "=" * 60)
             print("🎉 【最终结构化JSON输出】")
