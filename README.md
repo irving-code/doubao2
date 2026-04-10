@@ -27,9 +27,9 @@
 
 **克隆项目到本地**
 
-git clone https://github.com/你的用户名 / 你的仓库名.git
+git clone https://github.com/irving-code/doubao2.git
 
-cd 你的仓库名
+cd doubao2
 
 **（推荐）创建 Anaconda 虚拟环境（指定推荐的 Python 3.11 版本）**
 
